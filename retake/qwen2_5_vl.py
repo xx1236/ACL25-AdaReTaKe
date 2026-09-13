@@ -507,13 +507,9 @@ def retake_Qwen2_5_VLForConditionalGeneration_forward(
                     f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
                 )
 
-            mask = input_ids == self.config.image_token_id
-            mask_unsqueezed = mask.unsqueeze(-1)
-            mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-            image_mask = mask_expanded.to(inputs_embeds.device)
-
+            image_token_mask = input_ids == self.config.image_token_id
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds[image_token_mask] = image_embeds
 
         if pixel_values_videos is not None:
             n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
@@ -522,14 +518,10 @@ def retake_Qwen2_5_VLForConditionalGeneration_forward(
                 raise ValueError(
                     f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
                 )
-
-            mask = input_ids == self.config.video_token_id
-            mask_unsqueezed = mask.unsqueeze(-1)
-            mask_expanded = mask_unsqueezed.expand_as(inputs_embeds)
-            video_mask = mask_expanded.to(inputs_embeds.device)
-
+            # Avoid masked_scatter allocating a second full input-embedding tensor.
+            video_token_mask = input_ids == self.config.video_token_id
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            inputs_embeds[video_token_mask] = video_embeds
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)

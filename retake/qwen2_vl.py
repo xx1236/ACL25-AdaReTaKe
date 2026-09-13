@@ -38,78 +38,132 @@ def retake_Qwen2VLAttention_forward(
     output_attentions: bool = False,
     use_cache: bool = False,
     cache_position: Optional[torch.LongTensor] = None,
-    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+    **kwargs,  # absorb extra kwargs from transformers >= 4.57 (FlashAttentionKwargs etc.)
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    # transformers >= 4.57 renames past_key_value -> past_key_values
+    if past_key_value is None:
+        past_key_value = kwargs.pop('past_key_values', None)
     bsz, q_len, _ = hidden_states.size()
 
     query_states = self.q_proj(hidden_states)
     key_states = self.k_proj(hidden_states)
     value_states = self.v_proj(hidden_states)
 
-    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+    query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
-    kv_seq_len = key_states.shape[-2]
-    if past_key_value is not None:
-        kv_seq_len += cache_position[0] + 1
-
-    # Update position_ids if positional embeddings are reforged
-    if past_key_value is not None and getattr(past_key_value, "pos_embed_reforge", False):
+    # Update position_ids if positional embeddings are reforged.
+    # Guard: position_ids is 3D [batch, 3, seq_len] only during chunked prefill;
+    # during decode it is 2D [batch, seq_len] and reforging is not needed.
+    if (past_key_value is not None and getattr(past_key_value, "pos_embed_reforge", False)
+            and position_ids is not None and position_ids.dim() == 3):
+        # This code reforge the `position_ids` of current chunk,
+        # the `position_ids` of previous chunks are reforged in KVCache.update()
         prev_tempo_idx = past_key_value.get_prev_temporal_idx(self.layer_idx)
-        if prev_tempo_idx + 1 != position_ids[0,0,0]:
+        cur_tempo_idx = position_ids[0,0,0]
+        if prev_tempo_idx + 1 != cur_tempo_idx:
             assert bsz == 1
-            # print("Discontinuous positional ids %d + 1 != %d at layer %d" % (prev_tempo_idx,  position_ids[0,0,0], self.layer_idx))
-            position_ids[0,0,:] += prev_tempo_idx + 1 - position_ids[0,0,0]
+            # print("Warning! Discontinuous positional ids %d (prev) + 1 != %d (cur) at layer %d. Fixed!" % (prev_tempo_idx,  cur_tempo_idx, self.layer_idx))
+            # NOTE: clone `position_ids` to avoid influence of in-place ops in different layers
+            position_ids = position_ids.clone()
+            position_ids[0,0,:] += prev_tempo_idx + 1 - cur_tempo_idx
+        position_embeddings = None # `position_embeddings` need to be re-calculated
 
-    # NOTE: Compute position_ids internally to support positional id reforge from KV compression
-    cos, sin = self.rotary_emb(value_states, position_ids)
+    # Because the input can be padded, the absolute sequence length depends on the max position id.
+    if position_embeddings is None:
+        logger.warning_once(
+            "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+            "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+            "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+            "removed and `position_embeddings` will be mandatory."
+        )
+        cos, sin = self.rotary_emb(value_states, position_ids)
+    else:
+        cos, sin = position_embeddings
     query_states, key_states = apply_multimodal_rotary_pos_emb(
         query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
     )
 
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-        # Specific to KVCache compression methods
-        cache_kwargs.update({"query_states": query_states, "position_ids": position_ids, 
+        cache_kwargs.update({"query_states": query_states, "position_ids": position_ids,
                              "rotary_emb": self.rotary_emb, "mrope_section": self.rope_scaling["mrope_section"]})
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-    # repeat k/v heads if n_kv_heads < n_heads
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
+    # === Attention computation: dispatch based on transformers version ===
+    from packaging import version
+    import transformers as _tf
+    _ge_457 = version.parse(_tf.__version__) >= version.parse("4.57.0")
 
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+    if _ge_457:
+        # transformers >= 4.57: use the unified attention dispatch (flash/sdpa/eager)
+        # This preserves the correct attention backend (flash_attention_2 etc.)
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import eager_attention_forward
 
-    if attention_mask is not None:  # no matter the length, we just slice it
-        causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask
+        attention_interface = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-    # Fix precision issues in Qwen2-VL float16 inference
-    # Replace inf values with zeros in attention weights to prevent NaN propagation
-    if query_states.dtype == torch.float16:
-        attn_weights = torch.where(torch.isinf(attn_weights), torch.zeros_like(attn_weights), attn_weights)
-
-    # upcast attention to fp32
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-    attn_output = torch.matmul(attn_weights, value_states)
-
-    if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-        raise ValueError(
-            f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-            f" {attn_output.size()}"
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.head_dim**-0.5,
+            sliding_window=getattr(self, 'sliding_window', None),
+            position_ids=position_ids,
+            **kwargs,
         )
 
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    attn_output = attn_output.reshape(bsz, q_len, -1)
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
 
-    attn_output = self.o_proj(attn_output)
+        if not output_attentions:
+            attn_weights = None
 
-    if not output_attentions:
-        attn_weights = None
+        return attn_output, attn_weights
+    else:
+        # transformers < 4.57: use the original eager attention (for backward compat)
+        # repeat k/v heads if n_kv_heads < n_heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    return attn_output, attn_weights, past_key_value
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+        if attention_mask is not None:  # no matter the length, we just slice it
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+
+        # Fix precision issues in Qwen2-VL float16 inference
+        # Replace inf values with zeros in attention weights to prevent NaN propagation
+        if query_states.dtype == torch.float16:
+            attn_weights = torch.where(torch.isinf(attn_weights), torch.zeros_like(attn_weights), attn_weights)
+
+        # upcast attention to fp32
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, -1)
+
+        attn_output = self.o_proj(attn_output)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
 
 def retake_Qwen2VLForConditionalGeneration_compress_video_tokens(
@@ -291,6 +345,24 @@ def retake_Qwen2VLForConditionalGeneration_forward(
 ) -> Union[Tuple, Qwen2VLCausalLMOutputWithPast]:
     assert input_ids.shape[0] == 1, "Batch inference of long video is not supported yet!"
 
+    # transformers >= 4.57 moved the vision tower, language model and RoPE
+    # state beneath self.model. Keep compatibility with the original layout.
+    _new_arch = hasattr(self.model, "language_model")
+    _visual = self.model.visual if _new_arch else self.visual
+    _llm = self.model.language_model if _new_arch else self.model
+    _embed_tokens = _llm.embed_tokens
+    _vocab_size = self.config.text_config.vocab_size if _new_arch else self.config.vocab_size
+
+    def _get_rope_deltas():
+        return self.model.rope_deltas if _new_arch else self.rope_deltas
+
+    def _set_rope_deltas(value):
+        if _new_arch:
+            self.model.rope_deltas = value
+        else:
+            self.rope_deltas = value
+
+
     if (cache_position is not None and cache_position[0] == 0): # Prefill
         is_prefill = True
         # Calculate chunk size based on inputs
@@ -323,15 +395,16 @@ def retake_Qwen2VLForConditionalGeneration_forward(
     # if we get 4D attention mask we cannot calculate rope deltas anymore. TODO @raushan fixme
     if position_ids is None and (attention_mask is None or attention_mask.ndim == 2):
         # calculate RoPE index once per generation in the pre-fill stage only
-        if (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
-            position_ids, rope_deltas = self.get_rope_index(
+        if (cache_position is not None and cache_position[0] == 0) or _get_rope_deltas() is None:
+            get_rope_index = self.model.get_rope_index if _new_arch else self.get_rope_index
+            position_ids, rope_deltas = get_rope_index(
                 input_ids, image_grid_thw, video_grid_thw, attention_mask
             )
-            self.rope_deltas = rope_deltas
+            _set_rope_deltas(rope_deltas)
         # then use the prev pre-calculated rope-deltas to get the correct position ids
         else:
             batch_size, seq_length = input_ids.shape
-            delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
+            delta = cache_position[0] + _get_rope_deltas() if cache_position is not None else 0
             position_ids = torch.arange(seq_length, device=input_ids.device)
             position_ids = position_ids.view(1, -1).expand(batch_size, -1)
             if cache_position is not None:  # otherwise `deltas` is an int `0`
@@ -346,17 +419,17 @@ def retake_Qwen2VLForConditionalGeneration_forward(
 
         # Extract visual features
         if pixel_values is not None:
-            pixel_values = pixel_values.type(self.visual.get_dtype())
-            image_embeds = _extract_embeds(self.visual(pixel_values, grid_thw=image_grid_thw))
+            pixel_values = pixel_values.type(_visual.dtype if _new_arch else _visual.get_dtype())
+            image_embeds = _extract_embeds(_visual(pixel_values, grid_thw=image_grid_thw))
 
         if pixel_values_videos is not None:
-            pixel_values_videos = pixel_values_videos.type(self.visual.get_dtype())
+            pixel_values_videos = pixel_values_videos.type(_visual.dtype if _new_arch else _visual.get_dtype())
             grid_t, grid_h, grid_w = video_grid_thw[0]
             # NOTE: Split video into chunks to avoid OOM due to large activations during visual forward
             # chunk_size can be up to 128 or higher if you have flash attention
             frame_chunk_size = getattr(self.config, 'longvideo_kwargs', {}).get('frame_chunk_size', 1000000000)
             if grid_t < frame_chunk_size:
-                video_embeds = _extract_embeds(self.visual(pixel_values_videos, grid_thw=video_grid_thw))
+                video_embeds = _extract_embeds(_visual(pixel_values_videos, grid_thw=video_grid_thw))
             else:
                 d = pixel_values_videos.shape[-1]
                 pixel_values_videos = pixel_values_videos.reshape(grid_t, grid_h*grid_w, d)
@@ -367,7 +440,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                     video_grid_thw_chunk = video_grid_thw.clone()
                     video_grid_thw_chunk[0,0] = grid_t_chunk
                     video_embeds.append(
-                        _extract_embeds(self.visual(pixel_values_videos_chunk.reshape(-1, d), grid_thw=video_grid_thw_chunk))
+                        _extract_embeds(_visual(pixel_values_videos_chunk.reshape(-1, d), grid_thw=video_grid_thw_chunk))
                     )
                 video_embeds = torch.cat(video_embeds)
             # Compression video tokens
@@ -382,7 +455,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
             )
 
         # Concat visual and textual features
-        inputs_embeds = self.model.embed_tokens(input_ids)
+        inputs_embeds = _embed_tokens(input_ids)
         if pixel_values is not None:
             n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
             n_image_features = image_embeds.shape[0]
@@ -390,14 +463,9 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                 raise ValueError(
                     f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
                 )
-            image_mask = (
-                (input_ids == self.config.image_token_id)
-                .unsqueeze(-1)
-                .expand_as(inputs_embeds)
-                .to(inputs_embeds.device)
-            )
+            image_token_mask = input_ids == self.config.image_token_id
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+            inputs_embeds[image_token_mask] = image_embeds
 
         if pixel_values_videos is not None:
             n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
@@ -406,22 +474,19 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                 raise ValueError(
                     f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
                 )
-            video_mask = (
-                (input_ids == self.config.video_token_id)
-                .unsqueeze(-1)
-                .expand_as(inputs_embeds)
-                .to(inputs_embeds.device)
-            )
+            # masked_scatter materializes another full [batch, seq, hidden] tensor.
+            # Assign through the 2-D token mask so long-video prefill keeps a
+            # single input-embedding tensor instead.
+            video_token_mask = input_ids == self.config.video_token_id
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
-            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+            inputs_embeds[video_token_mask] = video_embeds
             if keypatches_mask is not None:
-                keypatches_mask = torch.zeros_like(input_ids).bool().masked_scatter(video_mask[:,:,0], keypatches_mask)
+                keypatches_mask = torch.zeros_like(input_ids).bool().masked_scatter(video_token_mask, keypatches_mask)
 
         if attention_mask is not None:
             attention_mask = attention_mask.to(inputs_embeds.device)
         if position_ids is not None:
             position_ids = position_ids.to(inputs_embeds.device)
-
     if is_prefill and chunk_size is not None: # Chunked prefill stage
         assert past_key_values is not None
         kvcache_compression = getattr(past_key_values, 'kvcache_compression', False)
@@ -435,7 +500,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
         for seg_id, (s, e, dtype) in enumerate(modality_segments):
             if dtype == 'text': # Prefill text without kvcache_compression
                 past_key_values.kvcache_compression = False
-                outputs = self.model(
+                outputs = _llm(
                     input_ids=None,
                     position_ids=position_ids[:,:,s:e],
                     attention_mask=attention_mask[:,:e],
@@ -464,7 +529,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
                     # Pass pre-computed temporal adaptation ratio for this chunk
                     if kvcache_compression and hasattr(past_key_values, 'set_temporal_adaptation_ratio'):
                         past_key_values.set_temporal_adaptation_ratio(chunk_compression_ratios[idx])
-                    outputs = self.model(
+                    outputs = _llm(
                         input_ids=None,
                         position_ids=position_ids_chunk,
                         attention_mask=attention_mask_chunk,
@@ -484,7 +549,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
             else:
                 raise ValueError
     else: # Decode / Standard prefill stage
-        outputs = self.model(
+        outputs = _llm(
             input_ids=None,
             position_ids=position_ids,
             attention_mask=attention_mask,
@@ -509,7 +574,7 @@ def retake_Qwen2VLForConditionalGeneration_forward(
         shift_labels = labels[..., 1:].contiguous()
         # Flatten the tokens
         loss_fct = CrossEntropyLoss()
-        shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        shift_logits = shift_logits.view(-1, _vocab_size)
         shift_labels = shift_labels.view(-1)
         # Enable model parallelism
         shift_labels = shift_labels.to(shift_logits.device)
@@ -525,5 +590,5 @@ def retake_Qwen2VLForConditionalGeneration_forward(
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
-        rope_deltas=self.rope_deltas,
+        rope_deltas=_get_rope_deltas(),
     )
